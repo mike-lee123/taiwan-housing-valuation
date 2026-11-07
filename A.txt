@@ -1,0 +1,277 @@
+import time
+from datetime import datetime, timedelta
+import numpy as np
+import pandas as pd
+import streamlit as st
+import yfinance as yf
+
+# 嘗試載入 Shioaji，若無環境則降級處理
+try:
+    import shioaji as sj
+    SHIOAJI_AVAILABLE = True
+except ImportError:
+    SHIOAJI_AVAILABLE = False
+
+# ==============================================================================
+# 0. 系統配置與防當機冷卻控制器 (Rate Limiter)
+# ==============================================================================
+st.set_page_config(page_title="ETF 波段成分股量化儀表板", layout="wide")
+
+class RequestCooldownManager:
+    """簡易冷卻節流器，確保頻繁調用時具備最小間隔防被阻斷"""
+    def __init__(self, min_interval_seconds=0.35):
+        self.min_interval = min_interval_seconds
+        self.last_request_time = 0.0
+
+    def wait(self):
+        elapsed = time.time() - self.last_request_time
+        if elapsed < self.min_interval:
+            time.sleep(self.min_interval - elapsed)
+        self.last_request_time = time.time()
+
+cooldown_manager = RequestCooldownManager(min_interval_seconds=0.3)
+
+# ==============================================================================
+# 1. ETF 成分股宇宙定義
+# ==============================================================================
+def get_etf_universe():
+    etf_holdings = {
+        "0050": ["2330", "2454", "2317", "2308", "2382", "2881", "2882"],
+        "0052": ["2330", "2454", "2317", "2382", "3034", "2379", "3008"],
+        "00935": ["2330", "2454", "2308", "6669", "2382", "3653", "3231"],
+        "00981A": ["2330", "2454", "3653", "6669", "3035", "3443", "3324"],
+        "00982A": ["2330", "2317", "3653", "3035", "8299", "3443", "6515"],
+        "00733": ["3653", "3324", "6515", "8299", "3035", "3529", "2467"]
+    }
+
+    core_pool = set(etf_holdings["0050"] + etf_holdings["0052"] + etf_holdings["00935"])
+    active_overlap = set(etf_holdings["00981A"]).intersection(set(etf_holdings["00982A"]))
+    momentum_pool = set(etf_holdings["00733"])
+
+    all_symbols = set()
+    for stocks in etf_holdings.values():
+        all_symbols.update(stocks)
+
+    stock_tags = {}
+    for sym in all_symbols:
+        tags = []
+        if sym in core_pool:
+            tags.append("核心權值")
+        if sym in active_overlap:
+            tags.append("法人共識")
+        if sym in momentum_pool and sym not in etf_holdings["0050"]:
+            tags.append("突破黑馬")
+        stock_tags[sym] = tags if tags else ["一般持股"]
+
+    return sorted(list(all_symbols)), stock_tags
+
+# ==============================================================================
+# 2. 數據獲取引擎 (Shioaji 優先，自動 Fallback 至 Yahoo Finance)
+# ==============================================================================
+@st.cache_resource
+def init_shioaji(api_key: str, secret_key: str):
+    """初始化並快取 Shioaji 連線實例"""
+    if not SHIOAJI_AVAILABLE or not api_key or not secret_key:
+        return None
+    try:
+        api = sj.Shioaji(simulation=True)
+        api.login(api_key=api_key, secret_key=secret_key)
+        api.fetch_contracts(contract_download=True)
+        return api
+    except Exception as e:
+        st.warning(f"Shioaji 登入或合約下載異常，已啟用 Yahoo Finance 備援機制: {e}")
+        return None
+
+def fetch_history_data(symbol: str, sj_api=None, lookback_days=180) -> pd.DataFrame:
+    """具備冷卻機制的個股歷史數據抓取"""
+    cooldown_manager.wait()
+    start_date = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+
+    # 1. 嘗試使用 Shioaji 抓取
+    if sj_api:
+        try:
+            contract = sj_api.Contracts.Stocks[symbol]
+            if contract:
+                kbars = sj_api.kbars(contract=contract, start=start_date)
+                df = pd.DataFrame({**kbars})
+                if not df.empty:
+                    df['ts'] = pd.to_datetime(df['ts'])
+                    df = df.rename(columns={
+                        'ts': 'Date', 'Open': 'Open', 'High': 'High',
+                        'Low': 'Low', 'Close': 'Close', 'Volume': 'Volume'
+                    }).set_index('Date')
+                    return df[['Open', 'High', 'Low', 'Close', 'Volume']]
+        except Exception:
+            pass
+
+    # 2. 備援使用 Yahoo Finance
+    try:
+        yf_ticker = f"{symbol}.TW"
+        df = yf.download(yf_ticker, period="8mo", interval="1d", progress=False)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        return df[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
+    except Exception:
+        return pd.DataFrame()
+
+# ==============================================================================
+# 3. 量價與指標過濾管線 (具備 Streamlit 快取保護)
+# ==============================================================================
+@st.cache_data(ttl=900, show_spinner=False)
+def run_screening_pipeline(_sj_api, min_vol_ratio: float, rs_window: int = 20):
+    tickers, stock_tags = get_etf_universe()
+    
+    # 抓取大盤基準
+    cooldown_manager.wait()
+    bench_df = yf.download("^TWII", period="8mo", interval="1d", progress=False)
+    if isinstance(bench_df.columns, pd.MultiIndex):
+        bench_df.columns = bench_df.columns.get_level_values(0)
+    bench_close = bench_df['Close'].dropna()
+    bench_rs = (bench_close.iloc[-1] / bench_close.iloc[-rs_window] - 1) if len(bench_close) >= rs_window else 0
+
+    results = []
+    progress_bar = st.progress(0)
+
+    for idx, sym in enumerate(tickers):
+        progress_bar.progress((idx + 1) / len(tickers))
+        df = fetch_history_data(sym, sj_api=_sj_api)
+
+        if df.empty or len(df) < 70:
+            continue
+
+        close = df['Close']
+        volume = df['Volume']
+        low = df['Low']
+
+        # 均線計算
+        ma20 = close.rolling(20).mean()
+        ma60 = close.rolling(60).mean()
+        vol_ma5 = volume.rolling(5).mean()
+
+        curr_close = float(close.iloc[-1])
+        curr_vol = float(volume.iloc[-1])
+        prev_vol_ma5 = float(vol_ma5.iloc[-2]) if len(vol_ma5) >= 2 else 1.0
+
+        # --- 趨勢濾網：季線扣抵向上且收盤價站穩月線之上 ---
+        cond_trend = (curr_close >= ma20.iloc[-1]) and \
+                     (curr_close >= ma60.iloc[-1]) and \
+                     (ma60.iloc[-1] > ma60.iloc[-5])
+
+        if not cond_trend:
+            continue
+
+        # --- 布林通道頻寬 (Bandwidth) ---
+        std20 = close.rolling(20).std()
+        bandwidth = ((ma20 + std20 * 2) - (ma20 - std20 * 2)) / ma20
+        min_bw_60 = bandwidth.iloc[-60:].min()
+        is_bandwidth_squeeze_turning = (bandwidth.iloc[-3:].min() <= min_bw_60 * 1.15) and \
+                                       (bandwidth.iloc[-1] > bandwidth.iloc[-2])
+
+        # --- 量能濾網 ---
+        cond_volume_surge = curr_vol >= (prev_vol_ma5 * min_vol_ratio)
+        if not (cond_volume_surge or is_bandwidth_squeeze_turning):
+            continue
+
+        # --- 相對強弱指標 (RS) ---
+        stock_rs = (curr_close / close.iloc[-rs_window] - 1)
+        rs_excess = stock_rs - bench_rs
+        if rs_excess <= 0:
+            continue
+
+        # 風控計算
+        recent_swing_low = float(low.iloc[-10:].min())
+        key_support = max(recent_swing_low, float(ma20.iloc[-1]))
+        suggested_stop_loss = min(key_support * 0.985, curr_close * 0.94)
+
+        triggers = []
+        if cond_volume_surge:
+            triggers.append(f"爆量突破(>{min_vol_ratio}x)")
+        if is_bandwidth_squeeze_turning:
+            triggers.append("布林極限壓縮轉折")
+
+        results.append({
+            "代碼": sym,
+            "所屬層級": " / ".join(stock_tags.get(sym, ["一般"])),
+            "收盤價": round(curr_close, 2),
+            "20日超額RS(%)": round(float(rs_excess) * 100, 2),
+            "成交量比率": round(curr_vol / prev_vol_ma5, 2),
+            "發動訊號": " + ".join(triggers),
+            "關鍵支撐": round(key_support, 2),
+            "建議停損點": round(suggested_stop_loss, 2)
+        })
+
+    progress_bar.empty()
+    res_df = pd.DataFrame(results)
+    if not res_df.empty:
+        res_df = res_df.sort_values(by="20日超額RS(%)", ascending=False).reset_index(drop=True)
+    return res_df
+
+# ==============================================================================
+# 4. Streamlit Dashboard 介面主體
+# ==============================================================================
+st.title("📈 ETF 成分股多層波段選股儀表板")
+st.caption("涵蓋核心權值 (0050/0052/00935)、法人共識 (00981A/00982A) 與高彈性黑馬 (00733)")
+
+# 側邊欄配置
+with st.sidebar:
+    st.header("⚙️ 引擎與參數設定")
+    with st.expander("永豐 Shioaji API 設定", expanded=False):
+        sj_api_key = st.text_input("API Key", type="password", help="若未填寫將自動轉為 Yahoo Finance 數據源")
+        sj_secret_key = st.text_input("Secret Key", type="password")
+
+    vol_multiplier = st.slider("成交量突破門檻 (相對於5日均量倍數)", 1.2, 3.0, 1.5, step=0.1)
+    top_candidates_count = st.slider("顯示推薦名單檔數", 3, 10, 5)
+
+    if st.button("🔄 強制清除快取並重新掃描", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
+
+# 初始化 API
+sj_instance = init_shioaji(sj_api_key, sj_secret_key)
+if sj_instance:
+    st.success("🟢 永豐證券 Shioaji API 連線成功 (主數據源已就緒)")
+else:
+    st.info("ℹ️ 目前運行於 Yahoo Finance 備援模式 (已啟用防當機冷卻節流器)")
+
+# 執行掃描
+with st.spinner("盤後量價與指標過濾管線執行中，請稍候..."):
+    screened_df = run_screening_pipeline(sj_instance, min_vol_ratio=vol_multiplier)
+
+# 呈現結果
+if not screened_df.empty:
+    top_df = screened_df.head(top_candidates_count)
+
+    st.subheader(f"🎯 今日臨界發動精選 Top {len(top_df)}")
+    
+    # 頂部關鍵指標展示
+    cols = st.columns(len(top_df))
+    for i, row in top_df.iterrows():
+        with cols[i]:
+            st.metric(
+                label=f"{row['代碼']} ({row['所屬層級'].split('/')[0]})",
+                value=f"{row['收盤價']} 元",
+                delta=f"RS +{row['20日超額RS(%)']}%"
+            )
+            st.caption(f"🛡️ 停損: {row['建議停損點']} | 支撐: {row['關鍵支撐']}")
+
+    st.markdown("---")
+    st.subheader("📋 完整量化波段清單與訊號明細")
+    st.dataframe(
+        screened_df,
+        column_config={
+            "成交量比率": st.column_config.ProgressColumn(
+                "成交量比率 (倍數)",
+                format="%.2f x",
+                min_value=0.5,
+                max_value=4.0
+            ),
+            "20日超額RS(%)": st.column_config.NumberColumn(
+                "20日相對大盤超額",
+                format="%.2f %%"
+            )
+        },
+        use_container_width=True,
+        hide_index=True
+    )
+else:
+    st.warning("今日無標的完全符合「季線上揚 + 站上月線 + 布林帶寬轉折/帶量 + RS > 0」的嚴格發動條件。")
